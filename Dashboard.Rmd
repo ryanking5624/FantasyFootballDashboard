@@ -1,0 +1,888 @@
+---
+title: "Fantasy Football Weekly Recap"
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: columns
+    vertical_layout: fill
+    theme: yeti
+params:
+  week: 9
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(rvest)
+library(RSelenium)
+library(flexdashboard)
+library(ggplot2)
+library(formattable)
+# thematic::thematic_on(bg = NA, fg = NA, accent = NA)
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+```
+
+```{r Data Import, include=FALSE, cache=TRUE}
+# NFL Abbreviations ----
+team_abbr <- data.frame(Abb = c("Ari", "Atl", "Bal", "Buf",
+                                "Car", "Chi", "Cin", "Cle",
+                                "Dal", "Den", "Det", "GB",
+                                "Hou", "Ind", "Jax", "KC",
+                                "LAC", "LAR", "LV",  "Mia",
+                                "Min", "NE",  "NO",  "NYG",
+                                "NYJ", "Phi", "Pit", "Sea",
+                                "SF",  "TB",  "Ten", "Wsh"),
+                        Full = c("Arizona Cardinals", "Atlanta Falcons", "Baltimore Ravens", "Buffalo Bills",
+                                 "Carolina Panthers", "Chicago Bears", "Cincinnati Bengals", "Cleveland Browns",
+                                 "Dallas Cowboys", "Denver Broncos", "Detroit Lions", "Green Bay Packers",
+                                 "Houston Texans", "Indianapolis Colts", "Jacksonville Jaguars", "Kansas City Chiefs",
+                                 "Los Angeles Chargers", "Los Angeles Rams", "Las Vegas Raiders", "Miami Dolphins",
+                                 "Minnesota Vikings", "New England Patriots", "New Orleans Saints", "New York Giants",
+                                 "New York Jets", "Philadelphia Eagles", "Pittsburgh Steelers", "Seattle Seahawks", 
+                                 "San Francisco 49ers", "Tampa Bay Buccaneers", "Tennessee Titans", "Washington Football Team"),
+                        stringsAsFactors = F) 
+
+# League Settings ----
+nteams <- 10
+roster_size <- 16
+nweeks <- 13
+pteams <- 6
+frbteams <- 2
+team_ids <- c(1,2,4,5,7,8,10,11,12,13)
+
+# Initialize Connection ----
+remDr <- remoteDriver(port = 4445L)
+remDr$open()
+
+# Map Teams to IDs ----
+team_id_table <- data.frame(ID = team_ids,
+                            Team = rep("", nteams))
+for(i in 1:nteams){
+  team_url <- paste0("https://fantasy.espn.com/football/team?leagueId=298261&teamId=", team_ids[i])
+  remDr$navigate(team_url)
+  Sys.sleep(5)
+  team_id_table[i, "Team"] <- remDr$getTitle() %>%
+    .[[1]] %>%
+    sub(" Clubhouse - SQUAD - ESPN Fantasy Football", "", .)
+}
+
+# Standings ----
+standings_url <- "https://fantasy.espn.com/football/league/standings?leagueId=298261"
+remDr$navigate(standings_url)
+Sys.sleep(5) # give the page time to fully load
+html <- remDr$getPageSource()[[1]]
+standings_text <- read_html(html) %>%
+  html_nodes(".Table__TH, .Table__TD") %>%
+  html_text()
+standings <- data.frame(matrix(nrow = nteams, ncol = 7))
+colnames(standings) <- standings_text[1:7]
+standings <- standings %>%
+  mutate(RK = standings_text[seq(from = 8, by = 7, length.out = nteams)],
+         Team = standings_text[seq(from = 9, by = 7, length.out = nteams)],
+         W = standings_text[seq(from = 10, by = 7, length.out = nteams)],
+         L = standings_text[seq(from = 11, by = 7, length.out = nteams)],
+         `T` = standings_text[seq(from = 12, by = 7, length.out = nteams)],
+         PCT = standings_text[seq(from = 13, by = 7, length.out = nteams)],
+         GB = standings_text[seq(from = 14, by = 7, length.out = nteams)])
+standings_secondary <- data.frame(matrix(nrow = nteams, ncol = 9))
+colnames(standings_secondary) <- c(colnames(standings)[1:2], 
+                                   standings_text[seq(from = 7+7*nteams+(2*(nteams+1))+1, by = 1, length.out = 7)])
+standings_secondary <- standings_secondary %>%
+  mutate(RK = standings$RK,
+         Team = standings$Team,
+         PF = standings_text[seq(from = 7+7*nteams+(2*(nteams+1))+8, by = 7, length.out = nteams)],
+         PA = standings_text[seq(from = 7+7*nteams+(2*(nteams+1))+9, by = 7, length.out = nteams)],
+         DIV = standings_text[seq(from = 7+7*nteams+(2*(nteams+1))+10, by = 7, length.out = nteams)],
+         HOME = standings_text[seq(from = 7+7*nteams+(2*(nteams+1))+11, by = 7, length.out = nteams)],
+         AWAY = standings_text[seq(from = 7+7*nteams+(2*(nteams+1))+12, by = 7, length.out = nteams)],
+         STRK = standings_text[seq(from = 7+7*nteams+(2*(nteams+1))+13, by = 7, length.out = nteams)],
+         MOVES = standings_text[seq(from = 7+7*nteams+(2*(nteams+1))+14, by = 7, length.out = nteams)])
+standings <- standings %>%
+  inner_join(standings_secondary, by = c("RK" = "RK", "Team" = "Team")) %>%
+  mutate(GB = if_else(GB == "--", "0", GB)) %>%
+  mutate_at(.vars = vars(RK, W, L, `T`, PCT, GB, PF, PA, MOVES), .funs = as.numeric)
+
+# Schedule ----
+schedule_url <- "https://fantasy.espn.com/football/league/schedule?leagueId=298261"
+remDr$navigate(schedule_url)
+Sys.sleep(5) # give the page time to fully load
+html <- remDr$getPageSource()[[1]]
+schedule <- read_html(html) %>%
+  html_nodes(".Table__TD") %>%
+  html_text() %>%
+  .[!grepl("Matchups to be determined", .)] %>%
+  matrix(data = ., ncol = 6, byrow = T) %>%
+  as.data.frame() %>%
+  rename(AwayTeam = V1,
+         AwayManagers = V2,
+         AwayScore = V3,
+         HomeScore = V4,
+         HomeManagers = V5,
+         HomeTeam = V6) %>%
+  group_by(1:nrow(.)) %>%
+  mutate(HomeTeam = sub("@", "", HomeTeam) %>%
+           strsplit(., "\\(") %>%
+           .[[1]] %>%
+           .[-length(.)] %>%
+           paste0(collapse = "("),
+         AwayTeam = strsplit(AwayTeam, "\\(") %>%
+           .[[1]] %>%
+           .[-length(.)] %>%
+           paste0(., collapse = "(")) %>%
+  as.data.frame() %>%
+  select(-`1:nrow(.)`) %>%
+  mutate(Week = rep(1:nweeks, each = nteams/2))
+
+# Scoreboard ----
+first_row_names <- function(df){
+  colnames(df) <- df[1,]
+  df <- df[2:nrow(df),]
+  return(df)
+}
+
+for(i in 1:length(team_ids)){
+  score_url <- paste0("https://fantasy.espn.com/football/boxscore?leagueId=298261&matchupPeriodId=", params$week, "&seasonId=2020&teamId=", team_ids[i])
+  remDr$navigate(score_url)
+  Sys.sleep(5) # give the page time to fully load
+  html <- remDr$getPageSource()[[1]]
+  scoreboard <- read_html(html) %>%
+    html_nodes(".Table") %>%
+    html_table()
+  names(scoreboard) <- read_html(html) %>%
+    html_nodes(".team-header") %>%
+    html_text() %>%
+    .[3:4] %>%
+    sub(" Box Score", "", .)
+  player_stripped <- read_html(html) %>%
+    html_nodes(".ttu , .playerinfo__playerteam , .pointer") %>%
+    html_text() %>%
+    .[-c(1:5)]
+  scoreboard <- scoreboard %>%
+    lapply(., first_row_names) %>%
+    bind_rows(., .id = "Team") %>%
+    filter(opp != "TOTALS")
+  scoreboard <- scoreboard %>%
+    mutate(Player = player_stripped[seq(from = 1, by = 3, length.out = nrow(scoreboard))],
+           tm = player_stripped[seq(from = 2, by = 3, length.out = nrow(scoreboard))],
+           pos = player_stripped[seq(from = 3, by = 3, length.out = nrow(scoreboard))]) %>%
+    select(Team, SLOT, Player, pos, tm, opp, STATUS, proj, FPTS)
+  if(i == 1){
+    scoreboard_all <- scoreboard
+  }else{
+    scoreboard_all <- scoreboard_all %>%
+      rbind(scoreboard) %>%
+      distinct(Team, SLOT, Player, pos, tm, opp, STATUS, proj, FPTS, .keep_all = T) %>%
+      mutate(proj = ifelse(proj == "--", "0", proj),
+             FPTS = ifelse(FPTS == "--", "0", FPTS)) %>%
+      mutate_at(.vars = vars(proj, FPTS), .funs = as.numeric)
+  }
+}
+
+# NFL Schedule ----
+full_schedule_url <- "https://www.pro-football-reference.com/years/2020/games.htm"
+remDr$navigate(full_schedule_url)
+Sys.sleep(5) # give the page time to fully load
+html <- remDr$getPageSource()[[1]]
+nfl_schedule <- read_html(html) %>%
+  html_nodes("#games") %>%
+  html_table() %>%
+  .[[1]] %>%
+  select(at = 6, boxscore = 8, everything()) %>%
+  select(-boxscore) %>%
+  select(Week:`Winner/tie`, at, `Loser/tie`:TOL) %>%
+  filter(Week != "Week") %>%
+  mutate(Date = as.Date(Date, format = "%B %d"),
+         TimeClass = case_when(grepl("AM", Time) ~ "Morning",
+                               substr(Time, 1, 2) %in% c(10,11) | substr(Time, 1,1) %in% c(6:9) ~ "Night",
+                               substr(Time, 1,2) == 12 | substr(Time, 1,1) %in% c(1,2) ~ "Day",
+                               substr(Time, 1,1) %in% c(3, 4, 5) ~ "Afternoon"))
+
+# Timeslots ----
+timeslots <- nfl_schedule %>%
+  filter(Week == params$week) %>%
+  mutate(Gametime = paste(Day, TimeClass)) %>%
+  pull(Gametime) %>%
+  unique()
+
+# Draft ----
+draft_url <- "https://fantasy.espn.com/football/league/draftrecap?leagueId=298261"
+remDr$navigate(draft_url)
+Sys.sleep(5) # give the page time to fully load
+html <- remDr$getPageSource()[[1]]
+draft <- read_html(html) %>%
+  html_nodes(".header , .Table__TD") %>%
+  html_text() %>%
+  .[-1] %>%
+  matrix(data = ., ncol = 3, byrow = T) %>%
+  as.data.frame() %>%
+  first_row_names() %>%
+  filter(Player != "Player") %>%
+  mutate(Round = rep(1:roster_size, each = nteams),
+         Overall = 1:nrow(.)) %>%
+  rename(Pick = `NO.`) %>%
+  select(Overall, Round, Pick, Player, Team)
+
+positions <- c("QB", "RB", "WR", "TE", "D/ST", "K")
+
+remDr$close()
+```
+
+```{r Matchup 1}
+home_team <- schedule %>%
+  filter(Week == params$week) %>%
+  slice(1) %>%
+  pull(HomeTeam)
+away_team <- schedule %>%
+  filter(Week == params$week) %>%
+  slice(1) %>%
+  pull(AwayTeam)
+```
+
+# `r paste0(away_team, " vs. ", home_team)` {data-navmenu="Matchups"}
+
+Column 
+-----------------------------------------------------------------------
+
+### Game Summary {data-height=120, .no-padding}
+
+```{r Game Summary}
+game_summary <- function(away_team, home_team){
+  title <- paste0(away_team, " vs. ", home_team)
+  used_row <- grep(home_team,
+                   schedule %>%
+                     filter(Week == params$week) %>%
+                     pull(HomeTeam))
+  p <- schedule %>%
+    filter(Week == params$week) %>%
+    slice(used_row) %>%
+    select(AwayScore, HomeScore) %>%
+    gt::gt() %>%
+    gt::tab_header(title = title) %>%
+    gt::cols_align("center") %>%
+    gt::tab_options(column_labels.hidden = TRUE)
+  return(p)
+}
+game_summary(away_team, home_team)
+```
+
+### Scoring Timeline {.no-padding}
+
+```{r Scoring Timeline}
+scoring_timeline <- function(away_team, home_team){
+  schedule_split <- nfl_schedule %>%
+    select(Week:at, PtsW, YdsW, TOW, TimeClass) %>%
+    rename(Team = `Winner/tie`,
+           Pts = PtsW,
+           Yds = YdsW,
+           TO = TOW) %>%
+    filter(Week == params$week) %>%
+    bind_rows(nfl_schedule %>%
+                select(Week:Time, at, `Loser/tie`, PtsL, YdsL:TimeClass) %>%
+                rename(Team = `Loser/tie`,
+                       Pts = PtsL,
+                       Yds = YdsL,
+                       TO = TOL) %>%
+                filter(Week == params$week)) %>%
+    left_join(team_abbr, by = c("Team" = "Full"))
+  p <- scoreboard_all %>%
+    filter(Team %in% c(home_team, away_team),
+           SLOT != "Bench") %>%
+    left_join(schedule_split %>%
+                select(-Team), 
+              by = c("tm" = "Abb")) %>%
+    group_by(Team, Day, TimeClass) %>%
+    summarize(Score = sum(FPTS, na.rm = T)) %>%
+    mutate(Gametime = paste(Day, TimeClass)) %>%
+    as.data.frame() %>%
+    filter(!is.na(Day)) %>%
+    group_by(Team) %>%
+    full_join(data.frame(timeslots = rep(timeslots, 2),
+                         team = c(rep(home_team, length(timeslots)), rep(away_team, length(timeslots)))), 
+              by = c("Gametime" = "timeslots", "Team" = "team")) %>%
+    mutate(Gametime = factor(Gametime, levels = timeslots, ordered = T)) %>%
+    arrange(Gametime) %>%
+    mutate(Score = replace_na(Score, 0),
+           cScore = cumsum(Score)) %>%
+    as.data.frame() %>% 
+    ggplot(data = ., aes(x = Gametime, y = cScore, colour = Team)) +
+    geom_line(aes(group = Team), size = 1.5) +
+    xlab(element_blank()) +
+    ylab("Fantasy Points") +
+    theme(legend.position = "bottom")
+  
+  return(p)
+}
+
+scoring_timeline(away_team, home_team)  
+```
+
+Column 
+-----------------------------------------------------------------------
+
+### Points by Position {.no-padding}
+
+```{r Points by Position}
+points_by_position <- function(away_team, home_team){
+  p <- scoreboard_all %>% 
+    filter(Team %in% c(home_team, away_team),
+           SLOT != "Bench") %>%
+    group_by(Team, pos) %>%
+    summarize(posFPTS = sum(FPTS)) %>%
+    as.data.frame() %>%
+    mutate(pos = factor(pos, levels = positions, ordered = T)) %>%
+    ggplot(data = ., aes(x = pos, y = posFPTS, fill = Team)) +
+    geom_bar(stat = "identity", position = "dodge") +
+    xlab(element_blank()) +
+    ylab("Fantasy Points")
+  return(p)
+}
+points_by_position(away_team, home_team)
+```
+
+### Top Scorers {data-height=250}
+
+```{r Top Scorers}
+top_scorers <- function(away_team, home_team){
+  p <- scoreboard_all %>% 
+    filter(Team == home_team,
+           SLOT != "Bench") %>%
+    slice_max(order_by = FPTS, n = 3, with_ties = F) %>%
+    select(Player, FPTS) %>%
+    rename(Player.x = Player, FPTS.x = FPTS) %>%
+    bind_cols(scoreboard_all %>% 
+                filter(Team == away_team,
+                       SLOT != "Bench") %>%
+                slice_max(order_by = FPTS, n = 3, with_ties = F) %>%
+                select(Player, FPTS) %>%
+                rename(Player.y = Player, FPTS.y = FPTS), 
+              .name_repair = "minimal") %>%
+    select(Player.x, FPTS.x, Player.y, FPTS.y) %>%
+    gt::gt() %>%
+    # gt::tab_header(title = "Top Scorers") %>%
+    gt::tab_spanner(label = home_team,
+                    columns = vars(Player.x, FPTS.x)) %>%
+    gt::tab_spanner(label = away_team,
+                    columns = vars(Player.y, FPTS.y)) %>%
+    gt::cols_label(Player.x = "Player",
+                   Player.y = "Player",
+                   FPTS.x = "FPTS",
+                   FPTS.y = "FPTS")
+  return(p)
+}
+
+top_scorers(away_team, home_team)
+```
+
+Column
+-----------------------------------------------------------------------
+
+### Optimized Lineups
+
+```{r Optimized Lineups}
+optimized_lineups <- function(away_team, home_team){
+  away_opt <- scoreboard_all %>% 
+    filter(Team == away_team) %>%
+    group_by(pos) %>%
+    mutate(FLEX = ifelse(pos %in% c("RB", "WR", "TE"), "YES", "NO"),
+           rank = rank(-FPTS, ties.method = "first"),
+           Starter = case_when(pos %in% c("QB", "TE", "K", "D/ST") & rank == 1 ~ "YES",
+                               pos %in% c("RB", "WR") & rank <= 2 ~ "YES",
+                               TRUE ~ "NO")) %>%
+    group_by(FLEX, Starter) %>%
+    mutate(FLEX_rank = rank(-FPTS, ties.method = "first")) %>%
+    filter(FLEX == "YES" & Starter == "NO" & FLEX_rank == 1 |
+             Starter == "YES") %>%
+    mutate(order_col = case_when(pos == "QB" ~ 1,
+                                 pos == "RB" & Starter == "YES" ~ 2,
+                                 pos == "WR" & Starter == "YES" ~ 3,
+                                 pos == "TE" & Starter == "YES" ~ 4,
+                                 Starter == "NO" ~ 5,
+                                 pos == "K" ~ 6,
+                                 TRUE ~ 7)) %>%
+    arrange(order_col) %>%
+    as.data.frame() %>%
+    mutate(NewStarter = ifelse(SLOT == "Bench", TRUE, FALSE),
+           SLOT = c("QB", "RB", "RB", "WR", "WR", "TE", "FLEX", "D/ST", "K")) %>%
+    select(SLOT, Player, FPTS, NewStarter) %>%
+    rename(!!away_team := Player,
+           NewStarter.x = NewStarter)
+  
+  home_opt <- scoreboard_all %>% 
+    filter(Team == home_team) %>%
+    group_by(pos) %>%
+    mutate(FLEX = ifelse(pos %in% c("RB", "WR", "TE"), "YES", "NO"),
+           rank = rank(-FPTS, ties.method = "first"),
+           Starter = case_when(pos %in% c("QB", "TE", "K", "D/ST") & rank == 1 ~ "YES",
+                               pos %in% c("RB", "WR") & rank <= 2 ~ "YES",
+                               TRUE ~ "NO")) %>%
+    group_by(FLEX, Starter) %>%
+    mutate(FLEX_rank = rank(-FPTS, ties.method = "first")) %>%
+    filter(FLEX == "YES" & Starter == "NO" & FLEX_rank == 1 |
+             Starter == "YES") %>%
+    mutate(order_col = case_when(pos == "QB" ~ 1,
+                                 pos == "RB" & Starter == "YES" ~ 2,
+                                 pos == "WR" & Starter == "YES" ~ 3,
+                                 pos == "TE" & Starter == "YES" ~ 4,
+                                 Starter == "NO" ~ 5,
+                                 pos == "K" ~ 6,
+                                 TRUE ~ 7)) %>%
+    arrange(order_col) %>%
+    as.data.frame() %>%
+    mutate(NewStarter = ifelse(SLOT == "Bench", TRUE, FALSE),
+           SLOT = c("QB", "RB", "RB", "WR", "WR", "TE", "FLEX", "D/ST", "K")) %>%
+    select(Player, FPTS, NewStarter) %>%
+    rename(!!home_team := Player,
+           `FPTS ` = FPTS,
+           NewStarter.y = NewStarter)
+  
+  p <- away_opt %>% 
+    bind_cols(home_opt, .name_repair = "minimal") %>%
+    janitor::adorn_totals() %>%
+    formattable(.,list(
+      FPTS = formatter("span", 
+                       style = ~ style(color = ifelse(NewStarter.x, "green", "black"))),
+      `FPTS ` = formatter("span", 
+                       style = ~ style(color = ifelse(NewStarter.y, "green", "black"))),
+      NewStarter.x = FALSE,
+      NewStarter.y = FALSE))
+  return(p)
+}
+optimized_lineups(away_team, home_team)
+```
+
+### Lowest Scorers {data-height=250}
+
+```{r Lowest Scorers}
+lowest_scorers <- function(away_team, home_team){
+  p <- scoreboard_all %>% 
+    filter(Team == home_team,
+           SLOT != "Bench") %>%
+    slice_min(order_by = FPTS, n = 3, with_ties = F) %>%
+    select(Player, FPTS) %>%
+    rename(Player.x = Player, FPTS.x = FPTS) %>%
+    bind_cols(scoreboard_all %>% 
+                filter(Team == away_team,
+                       SLOT != "Bench") %>%
+                slice_min(order_by = FPTS, n = 3, with_ties = F) %>%
+                select(Player, FPTS) %>%
+                rename(Player.y = Player, FPTS.y = FPTS), 
+              .name_repair = "minimal") %>%
+    select(Player.x, FPTS.x, Player.y, FPTS.y) %>%
+    gt::gt() %>%
+    # gt::tab_header(title = "Lowest Scorers") %>%
+    gt::tab_spanner(label = home_team,
+                    columns = vars(Player.x, FPTS.x)) %>%
+    gt::tab_spanner(label = away_team,
+                    columns = vars(Player.y, FPTS.y)) %>%
+    gt::cols_label(Player.x = "Player",
+                   Player.y = "Player",
+                   FPTS.x = "FPTS",
+                   FPTS.y = "FPTS")
+  return(p)
+}
+lowest_scorers(away_team, home_team)
+```
+
+```{r Matchup 2}
+home_team <- schedule %>%
+  filter(Week == params$week) %>%
+  slice(2) %>%
+  pull(HomeTeam)
+away_team <- schedule %>%
+  filter(Week == params$week) %>%
+  slice(2) %>%
+  pull(AwayTeam)
+```
+
+# `r paste0(away_team, " vs. ", home_team)` {data-navmenu="Matchups"}
+
+Column 
+-----------------------------------------------------------------------
+
+### Game Summary {data-height=120, .no-padding}
+
+```{r Game Summary 2}
+game_summary(away_team, home_team)
+```
+
+### Scoring Timeline {.no-padding}
+
+```{r Scoring Timeline 2}
+scoring_timeline(away_team, home_team)  
+```
+
+Column 
+-----------------------------------------------------------------------
+
+### Points by Position {.no-padding}
+
+```{r Points by Position 2}
+points_by_position(away_team, home_team)
+```
+
+### Top Scorers {data-height=250}
+
+```{r Top Scorers 2}
+top_scorers(away_team, home_team)
+```
+
+Column
+-----------------------------------------------------------------------
+
+### Optimized Lineups
+
+```{r Optimized Lineups 2}
+optimized_lineups(away_team, home_team)
+```
+
+### Lowest Scorers {data-height=250}
+
+```{r Lowest Scorers 2}
+lowest_scorers(away_team, home_team)
+```
+
+```{r Matchup 3}
+home_team <- schedule %>%
+  filter(Week == params$week) %>%
+  slice(3) %>%
+  pull(HomeTeam)
+away_team <- schedule %>%
+  filter(Week == params$week) %>%
+  slice(3) %>%
+  pull(AwayTeam)
+```
+
+# `r paste0(away_team, " vs. ", home_team)` {data-navmenu="Matchups"}
+
+Column 
+-----------------------------------------------------------------------
+
+### Game Summary {data-height=120, .no-padding}
+
+```{r Game Summary 3}
+game_summary(away_team, home_team)
+```
+
+### Scoring Timeline {.no-padding}
+
+```{r Scoring Timeline 3}
+scoring_timeline(away_team, home_team)  
+```
+
+Column 
+-----------------------------------------------------------------------
+
+### Points by Position {.no-padding}
+
+```{r Points by Position 3}
+points_by_position(away_team, home_team)
+```
+
+### Top Scorers {data-height=250}
+
+```{r Top Scorers 3}
+top_scorers(away_team, home_team)
+```
+
+Column
+-----------------------------------------------------------------------
+
+### Optimized Lineups
+
+```{r Optimized Lineups 3}
+optimized_lineups(away_team, home_team)
+```
+
+### Lowest Scorers {data-height=250}
+
+```{r Lowest Scorers 3}
+lowest_scorers(away_team, home_team)
+```
+
+```{r Matchup 4}
+home_team <- schedule %>%
+  filter(Week == params$week) %>%
+  slice(4) %>%
+  pull(HomeTeam)
+away_team <- schedule %>%
+  filter(Week == params$week) %>%
+  slice(4) %>%
+  pull(AwayTeam)
+```
+
+# `r paste0(away_team, " vs. ", home_team)` {data-navmenu="Matchups"}
+
+Column 
+-----------------------------------------------------------------------
+
+### Game Summary {data-height=120, .no-padding}
+
+```{r Game Summary 4}
+game_summary(away_team, home_team)
+```
+
+### Scoring Timeline {.no-padding}
+
+```{r Scoring Timeline 4}
+scoring_timeline(away_team, home_team)  
+```
+
+Column 
+-----------------------------------------------------------------------
+
+### Points by Position {.no-padding}
+
+```{r Points by Position 4}
+points_by_position(away_team, home_team)
+```
+
+### Top Scorers {data-height=250}
+
+```{r Top Scorers 4}
+top_scorers(away_team, home_team)
+```
+
+Column
+-----------------------------------------------------------------------
+
+### Optimized Lineups
+
+```{r Optimized Lineups 4}
+optimized_lineups(away_team, home_team)
+```
+
+### Lowest Scorers {data-height=250}
+
+```{r Lowest Scorers 4}
+lowest_scorers(away_team, home_team)
+```
+
+```{r Matchup 5}
+home_team <- schedule %>%
+  filter(Week == params$week) %>%
+  slice(5) %>%
+  pull(HomeTeam)
+away_team <- schedule %>%
+  filter(Week == params$week) %>%
+  slice(5) %>%
+  pull(AwayTeam)
+```
+
+# `r paste0(away_team, " vs. ", home_team)` {data-navmenu="Matchups"}
+
+Column 
+-----------------------------------------------------------------------
+
+### Game Summary {data-height=120, .no-padding}
+
+```{r Game Summary 5}
+game_summary(away_team, home_team)
+```
+
+### Scoring Timeline {.no-padding}
+
+```{r Scoring Timeline 5}
+scoring_timeline(away_team, home_team)  
+```
+
+Column 
+-----------------------------------------------------------------------
+
+### Points by Position {.no-padding}
+
+```{r Points by Position 5}
+points_by_position(away_team, home_team)
+```
+
+### Top Scorers {data-height=250}
+
+```{r Top Scorers 5}
+top_scorers(away_team, home_team)
+```
+
+Column
+-----------------------------------------------------------------------
+
+### Optimized Lineups
+
+```{r Optimized Lineups 5}
+optimized_lineups(away_team, home_team)
+```
+
+### Lowest Scorers {data-height=250}
+
+```{r Lowest Scorers 5}
+lowest_scorers(away_team, home_team)
+```
+
+# League Statistics
+
+Column
+-----------------------------------------------------------------------
+
+### Points by Week {.no-padding}
+
+```{r PbW, fig.width=10, fig.height=5}
+schedule %>%
+  select(AwayTeam, AwayScore, Week) %>%
+  rename(Team = AwayTeam, Score = AwayScore) %>%
+  bind_rows(schedule %>%
+              select(HomeTeam, HomeScore, Week) %>%
+              rename(Team = HomeTeam, Score = HomeScore)) %>%
+  filter(Week <= params$week) %>%
+  mutate(Score = as.numeric(Score),
+         Week = as.character(Week)) %>% 
+  ggplot(data = ., aes(x = Week, y = Score, colour = Team)) +
+  geom_point(aes(group = Team), size = 1)
+```
+
+### Points vs. Projected
+
+```{r PvP}
+
+```
+
+Column
+-----------------------------------------------------------------------
+
+### Lineup Optimization
+
+```{r Total Lineup Optimization}
+
+```
+
+### Drafted vs Added Points
+
+```{r DvA}
+
+```
+
+Column
+-----------------------------------------------------------------------
+
+### Most Valuable Players
+
+```{r MVP}
+
+```
+
+### Least Valuable Players
+
+```{r LVP}
+
+```
+
+# Playoffs
+
+### Playoff Picture
+
+```{r Playoff Picture}
+games_remaining <- max(schedule$Week)-params$week
+
+standings %>%
+  mutate(clinched = if_else(GB+games_remaining < standings[pteams, "GB"], TRUE, FALSE),
+         eliminated = if_else(GB-games_remaining > standings[pteams, "GB"], TRUE, FALSE)) %>%
+  select(RK, Team, W, L, GB, PF, PA, STRK, clinched, eliminated) %>%
+  formattable(.,list(
+      RK = formatter("span", 
+                       style = ~ style(color = case_when(clinched ~ "green",
+                                                         eliminated ~ "red",
+                                                         TRUE ~ "black"))),
+      Team = formatter("span", 
+                       style = ~ style(color = case_when(clinched ~ "green",
+                                                         eliminated ~ "red",
+                                                         TRUE ~ "black"))),
+      W = formatter("span", 
+                       style = ~ style(color = case_when(clinched ~ "green",
+                                                         eliminated ~ "red",
+                                                         TRUE ~ "black"))),
+      L = formatter("span", 
+                       style = ~ style(color = case_when(clinched ~ "green",
+                                                         eliminated ~ "red",
+                                                         TRUE ~ "black"))),
+      PF = formatter("span", 
+                       style = ~ style(color = case_when(clinched ~ "green",
+                                                         eliminated ~ "red",
+                                                         TRUE ~ "black"))),
+      PA = formatter("span", 
+                       style = ~ style(color = case_when(clinched ~ "green",
+                                                         eliminated ~ "red",
+                                                         TRUE ~ "black"))),
+      STRK = formatter("span", 
+                       style = ~ style(color = case_when(clinched ~ "green",
+                                                         eliminated ~ "red",
+                                                         TRUE ~ "black"))),
+      clinched = FALSE,
+      eliminated = FALSE))
+```
+
+### Playoff Probabilities
+
+```{r Playoff Probs}
+projections <- schedule %>% 
+  filter(Week > params$week) %>%
+  left_join(standings %>%
+              rename(AwayPCT = PCT) %>%
+              select(Team, AwayPCT),
+            by = c("AwayTeam" = "Team")) %>%
+  left_join(standings %>%
+              rename(HomePCT = PCT) %>%
+              select(Team, HomePCT),
+            by = c("HomeTeam" = "Team")) %>%
+  mutate(AwayProb = (AwayPCT^2)/(AwayPCT^2+HomePCT^2),
+         HomeProb = 1-AwayProb,
+         SD = AwayProb*HomeProb)
+nsim <- 1000
+results <- matrix(nrow = nsim, ncol = nrow(projections))
+final_standings <- matrix(nrow = nsim, ncol = pteams)
+for(sim in 1:nsim){
+  for(matchup in 1:nrow(projections)){
+    results[sim, matchup] <- rbinom(1,1,projections[matchup, "AwayProb"])
+    final_standings[sim,] <- projections %>%
+      mutate(AwayWin = results[sim,],
+             HomeWin = if_else(AwayWin == 0, 1, 0)) %>%
+      select(AwayTeam, AwayWin) %>%
+      rename(Team = AwayTeam, Win = AwayWin) %>%
+      bind_rows(projections %>%
+                  mutate(AwayWin = results[sim,],
+                         HomeWin = if_else(AwayWin == 0, 1, 0)) %>%
+                  select(HomeTeam, HomeWin) %>%
+                  rename(Team = HomeTeam, Win = HomeWin)) %>%
+      group_by(Team) %>%
+      summarize(ExpWins = sum(Win)) %>%
+      as.data.frame() %>%
+      mutate(ExpLosses = games_remaining-ExpWins) %>%
+      inner_join(standings, by = c("Team" = "Team")) %>%
+      mutate(WinFinal = W + ExpWins,
+             LossFinal = L + ExpLosses) %>%
+      arrange(desc(WinFinal), desc(PF)) %>%
+      mutate(RK = 1:nteams) %>%
+      filter(RK <= pteams) %>%
+      pull(Team)
+  }
+  if(sim %% 50 == 0){
+    print(sim/nsim)
+  }
+}
+
+
+projections %>%
+  select(AwayTeam, AwayProb) %>%
+  rename(Team = AwayTeam, Prob = AwayProb) %>%
+  bind_rows(projections %>%
+              select(HomeTeam, HomeProb) %>%
+              rename(Team = HomeTeam, Prob = HomeProb)) %>%
+  group_by(Team) %>%
+  summarize(ExpWins = sum(Prob)) %>%
+  as.data.frame() %>%
+  mutate(ExpLosses = games_remaining-ExpWins) %>%
+  inner_join(standings, by = c("Team" = "Team")) %>%
+  mutate(WinFinal = W + ExpWins,
+         LossFinal = L + ExpLosses) %>%
+  arrange(desc(WinFinal)) %>%
+  mutate(RK = 1:nteams,
+         WinFinal = round(WinFinal),
+         LossFinal = round(LossFinal)) %>%
+  select(RK, Team, WinFinal, LossFinal) %>%
+  rename(ExpWins = WinFinal, ExpLosses = LossFinal)
+  
+```
+
